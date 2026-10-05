@@ -1,0 +1,13 @@
+.venv/
+.tmp/
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.log
+build/
+dist/
+*.egg-info/
+docs/verification.local.json

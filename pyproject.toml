@@ -1,0 +1,9 @@
+[project]
+name = "mesa-ti"
+version = "1.0.0"
+description = "Sistema de tickets de soporte TI con Flet y MySQL"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

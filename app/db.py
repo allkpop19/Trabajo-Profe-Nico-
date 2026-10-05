@@ -1,12 +1,64 @@
-"""Una conexión por operación, transacciones cortas y errores comprensibles."""
+"""Conexiones reutilizables y transacciones cortas sin compartir sockets."""
 from contextlib import contextmanager
 import logging
+from queue import LifoQueue, Empty
+from threading import BoundedSemaphore, Lock
+from time import monotonic
 import pymysql
 from app.config import connection_options
 
 
 class AppError(Exception):
     """Error apto para mostrar al usuario sin exponer credenciales."""
+
+
+_connections = LifoQueue(maxsize=4)
+_slots = BoundedSemaphore(4)
+_revision_lock = Lock()
+_revision = 0
+
+
+def data_revision():
+    with _revision_lock:
+        return _revision
+
+
+def invalidate_reads():
+    global _revision
+    with _revision_lock:
+        _revision += 1
+
+
+def _close(connection):
+    try:
+        connection.close()
+    except pymysql.MySQLError:
+        pass
+
+
+def _checkout():
+    try:
+        connection, returned_at = _connections.get_nowait()
+    except Empty:
+        connection = None
+    if connection:
+        try:
+            if not connection.open:
+                raise pymysql.OperationalError(2006, "Conexión cerrada")
+            if monotonic() - returned_at > 15:
+                connection.ping(reconnect=False)
+            return connection
+        except pymysql.MySQLError:
+            _close(connection)
+    # Reintentar solo la apertura; nunca repetir escrituras tras un corte.
+    for attempt in range(2):
+        try:
+            options = connection_options()
+            options["autocommit"] = True
+            return pymysql.connect(**options, cursorclass=pymysql.cursors.DictCursor)
+        except pymysql.OperationalError as error:
+            if attempt or error.args[0] not in (2003, 2006, 2013):
+                raise
 
 
 def readable_error(error):
@@ -31,22 +83,43 @@ def readable_error(error):
 
 
 @contextmanager
-def transaction():
+def transaction(read_only=False):
+    if not _slots.acquire(timeout=5):
+        raise AppError("El servidor está ocupado. Intenta nuevamente en unos segundos.")
     connection = None
+    reusable = True
     try:
-        connection = pymysql.connect(**connection_options(), cursorclass=pymysql.cursors.DictCursor)
+        connection = _checkout()
+        if not read_only:
+            connection.begin()
         with connection.cursor() as cursor:
             yield cursor
-        connection.commit()
+        if not read_only:
+            connection.commit()
+            invalidate_reads()
     except pymysql.MySQLError as error:
-        if connection:
-            connection.rollback()
+        reusable = error.args[0] not in (2003, 2006, 2013)
+        if connection and not read_only:
+            try:
+                connection.rollback()
+            except pymysql.MySQLError:
+                reusable = False
+            invalidate_reads()
         logging.warning("Operación de base fallida, código %s", error.args[0] if error.args else "desconocido")
         raise AppError(readable_error(error)) from error
     except Exception:
-        if connection:
-            connection.rollback()
+        if connection and not read_only:
+            try:
+                connection.rollback()
+            except pymysql.MySQLError:
+                reusable = False
         raise
     finally:
-        if connection:
-            connection.close()
+        try:
+            if connection:
+                if reusable and connection.open:
+                    _connections.put_nowait((connection, monotonic()))
+                else:
+                    _close(connection)
+        finally:
+            _slots.release()

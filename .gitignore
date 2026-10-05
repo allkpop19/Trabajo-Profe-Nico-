@@ -10,4 +10,3 @@ __pycache__/
 build/
 dist/
 *.egg-info/
-docs/verification.local.json

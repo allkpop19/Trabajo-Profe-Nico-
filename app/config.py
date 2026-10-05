@@ -1,5 +1,6 @@
 """Configuración local; nunca incluye secretos en el código."""
 import os
+import ssl
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -14,11 +15,11 @@ def connection_options():
         user=os.getenv("DB_USER", ""),
         password=os.getenv("DB_PASSWORD", ""),
         database=os.getenv("DB_NAME", "soporte_ti"),
-        charset="utf8mb4", connect_timeout=10,
-        read_timeout=20, write_timeout=20, autocommit=False,
+        charset="utf8mb4", connect_timeout=5,
+        read_timeout=10, write_timeout=10, autocommit=False,
     )
     if os.getenv("DB_SSL", "false").lower() == "true":
-        options["ssl"] = {"check_hostname": True}
+        options["ssl"] = {"check_hostname": True, "verify_mode": ssl.CERT_REQUIRED}
         ca = os.getenv("DB_SSL_CA")
         if ca:
             options["ssl"]["ca"] = ca

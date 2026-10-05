@@ -1,5 +1,9 @@
 """Consultas parametrizadas. La interfaz no contiene SQL."""
-from app.db import transaction, AppError
+from copy import deepcopy
+from functools import wraps
+from threading import Lock
+from time import monotonic
+from app.db import transaction, AppError, data_revision
 from app.validation import clean_text, validate_email, validate_ticket, STATUSES, PRIORITIES
 
 TICKET_SELECT = """
@@ -11,25 +15,75 @@ JOIN mt_specialties s ON s.id=t.specialty_id
 LEFT JOIN mt_users tech ON tech.id=t.technician_id
 """
 
+TICKET_LIST_SELECT = TICKET_SELECT.replace("t.*", "t.id,t.title,t.status,t.priority,t.requester_id,t.specialty_id,t.technician_id,t.created_at,t.version")
+
+
+def cached_read(function):
+    """Caché breve; todas las escrituras de la aplicación la invalidan."""
+    @wraps(function)
+    def wrapper(self, *args, **kwargs):
+        key = (function.__name__, args, tuple(sorted(kwargs.items())))
+        revision = data_revision()
+        with self._cache_lock:
+            entry = self._cache.get(key)
+            if entry and entry[0] == revision and entry[1] > monotonic():
+                return deepcopy(entry[2])
+        result = function(self, *args, **kwargs)
+        with self._cache_lock:
+            if len(self._cache) >= 64:
+                self._cache.clear()
+            self._cache[key] = (revision, monotonic() + 10, deepcopy(result))
+        return result
+    return wrapper
+
+
+def ticket_filters(query, status, priority, specialty):
+    clauses, values = [], []
+    if query.strip():
+        clauses.append("(t.title LIKE %s OR t.description LIKE %s OR u.name LIKE %s OR tech.name LIKE %s)")
+        values.extend([f"%{query.strip()}%"] * 4)
+    for column, value in (("t.status", status), ("t.priority", priority), ("t.specialty_id", specialty)):
+        if value:
+            clauses.append(f"{column}=%s")
+            values.append(value)
+    return (" WHERE " + " AND ".join(clauses) if clauses else ""), values
+
 
 class Repository:
+    def __init__(self):
+        self._cache = {}
+        self._cache_lock = Lock()
+
+    def refresh(self):
+        with self._cache_lock:
+            self._cache.clear()
+
     def tickets(self, query="", status="", priority="", specialty=""):
-        clauses, values = [], []
-        if query.strip():
-            # LIKE usa parámetros; se buscan también solicitantes y técnicos.
-            clauses.append("(t.title LIKE %s OR t.description LIKE %s OR u.name LIKE %s OR tech.name LIKE %s)")
-            values.extend([f"%{query.strip()}%"] * 4)
-        for column, value in (("t.status", status), ("t.priority", priority), ("t.specialty_id", specialty)):
-            if value:
-                clauses.append(f"{column}=%s")
-                values.append(value)
-        with transaction() as cursor:
-            cursor.execute(TICKET_SELECT + (" WHERE " + " AND ".join(clauses) if clauses else "")
+        where, values = ticket_filters(query, status, priority, specialty)
+        with transaction(read_only=True) as cursor:
+            cursor.execute(TICKET_SELECT + where
                            + " ORDER BY FIELD(t.priority,'critica','alta','media','baja'),t.created_at DESC,t.id DESC", values)
             return cursor.fetchall()
 
+    @cached_read
+    def ticket_page(self, query="", status="", priority="", specialty="", page=0, page_size=25):
+        where, values = ticket_filters(query, status, priority, specialty)
+        page = max(0, int(page))
+        page_size = min(50, max(1, int(page_size)))
+        select = TICKET_LIST_SELECT.replace("SELECT ", "SELECT COUNT(*) OVER() AS filtered_total,", 1)
+        with transaction(read_only=True) as cursor:
+            cursor.execute(select + where
+                + " ORDER BY FIELD(t.priority,'critica','alta','media','baja'),t.created_at DESC,t.id DESC LIMIT %s OFFSET %s",
+                values + [page_size, page * page_size])
+            rows = cursor.fetchall()
+            total = rows[0]["filtered_total"] if rows else 0
+            if not rows and page:
+                cursor.execute("SELECT COUNT(*) AS total FROM " + TICKET_SELECT.split("FROM ", 1)[1] + where, values)
+                total = cursor.fetchone()["total"]
+            return rows, total
+
     def ticket(self, ticket_id):
-        with transaction() as cursor:
+        with transaction(read_only=True) as cursor:
             cursor.execute(TICKET_SELECT + " WHERE t.id=%s", (ticket_id,))
             result = cursor.fetchone()
             if not result:
@@ -88,7 +142,7 @@ class Repository:
                 pass
 
     def history(self, ticket_id):
-        with transaction() as cursor:
+        with transaction(read_only=True) as cursor:
             cursor.execute("""SELECT h.*,old.name AS old_technician,new.name AS new_technician
                 FROM mt_ticket_history h
                 LEFT JOIN mt_users old ON old.id=h.old_technician_id
@@ -96,24 +150,29 @@ class Repository:
                 WHERE h.ticket_id=%s ORDER BY h.id DESC""", (ticket_id,))
             return cursor.fetchall()
 
+    @cached_read
     def dashboard(self):
-        with transaction() as cursor:
-            cursor.execute("SELECT status,COUNT(*) AS total FROM mt_tickets GROUP BY status")
-            counts = {row["status"]: row["total"] for row in cursor.fetchall()}
+        with transaction(read_only=True) as cursor:
+            cursor.execute("SELECT status,priority,COUNT(*) AS total FROM mt_tickets GROUP BY status,priority")
+            counts, priorities = {}, {}
+            for row in cursor.fetchall():
+                counts[row["status"]] = counts.get(row["status"], 0) + row["total"]
+                if row["status"] in ("abierto", "en_progreso"):
+                    priorities[row["priority"]] = priorities.get(row["priority"], 0) + row["total"]
             cursor.execute("""SELECT s.name AS specialty,COUNT(t.id) AS total,
                 SUM(CASE WHEN t.status IN ('abierto','en_progreso') THEN 1 ELSE 0 END) AS pending
                 FROM mt_specialties s LEFT JOIN mt_tickets t ON t.specialty_id=s.id
                 GROUP BY s.id,s.name ORDER BY total DESC,s.name""")
             summary = cursor.fetchall()
-            cursor.execute("""SELECT priority,COUNT(*) AS total FROM mt_tickets
-                WHERE status IN ('abierto','en_progreso') GROUP BY priority""")
-            priorities = {row["priority"]: row["total"] for row in cursor.fetchall()}
-            return counts, summary, priorities
+            cursor.execute(TICKET_LIST_SELECT + " ORDER BY t.created_at DESC,t.id DESC LIMIT 5")
+            recent = cursor.fetchall()
+            return counts, summary, priorities, recent
 
+    @cached_read
     def catalog(self, kind):
         if kind not in ("departments", "specialties"):
             raise AppError("Catálogo no válido.")
-        with transaction() as cursor:
+        with transaction(read_only=True) as cursor:
             cursor.execute(f"SELECT * FROM mt_{kind} ORDER BY name")
             return cursor.fetchall()
 
@@ -134,8 +193,9 @@ class Repository:
         with transaction() as cursor:
             cursor.execute(f"DELETE FROM mt_{kind} WHERE id=%s", (item_id,))
 
+    @cached_read
     def users(self, active_only=False):
-        with transaction() as cursor:
+        with transaction(read_only=True) as cursor:
             cursor.execute("""SELECT u.*,d.name AS department,tech.user_id IS NOT NULL AS is_technician
                 FROM mt_users u JOIN mt_departments d ON d.id=u.department_id
                 LEFT JOIN mt_technicians tech ON tech.user_id=u.id"""
@@ -160,8 +220,9 @@ class Repository:
         with transaction() as cursor:
             cursor.execute("DELETE FROM mt_users WHERE id=%s", (user_id,))
 
+    @cached_read
     def technicians(self, specialty_id=None):
-        with transaction() as cursor:
+        with transaction(read_only=True) as cursor:
             cursor.execute("""SELECT u.id,u.name,u.email,u.active,
                 GROUP_CONCAT(s.name ORDER BY s.name SEPARATOR ', ') AS specialties
                 FROM mt_technicians tech JOIN mt_users u ON u.id=tech.user_id
@@ -171,8 +232,9 @@ class Repository:
                 + " GROUP BY u.id,u.name,u.email,u.active ORDER BY u.name", (specialty_id,) if specialty_id else ())
             return cursor.fetchall()
 
+    @cached_read
     def technician_specialties(self, user_id):
-        with transaction() as cursor:
+        with transaction(read_only=True) as cursor:
             cursor.execute("SELECT specialty_id FROM mt_technician_specialties WHERE technician_id=%s", (user_id,))
             return {row["specialty_id"] for row in cursor.fetchall()}
 
